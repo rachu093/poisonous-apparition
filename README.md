@@ -29,4 +29,5 @@ We designed the backend around strict set-based database operations to ensure hi
 
 ---
 
-## Project Structure
+🌐 **Live Demo URL:** [https://optics-poly-travels-edited.trycloudflare.com](https://optics-poly-travels-edited.trycloudflare.com)  
+🔑 **Demo Credentials:** `admin@brightloop.com` / `Admin@12345`
