@@ -28,6 +28,5 @@ We designed the backend around strict set-based database operations to ensure hi
   Generates clean, printable A4 PDF invoices on demand using ReportLab.
 
 ---
-
-🌐 **Live Demo URL:** [https://optics-poly-travels-edited.trycloudflare.com](https://optics-poly-travels-edited.trycloudflare.com)  
-🔑 **Demo Credentials:** `admin@brightloop.com` / `Admin@12345`
+ **Live Demo URL:** [https://optics-poly-travels-edited.trycloudflare.com](https://optics-poly-travels-edited.trycloudflare.com)  
+**Demo Credentials:** `admin@brightloop.com` / `Admin@12345`
