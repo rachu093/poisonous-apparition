@@ -12,6 +12,7 @@ Tech Stack:
 """
 
 import asyncio
+import calendar
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -458,6 +459,28 @@ async def emit_live_event(db: AsyncSession, event_type: str, payload: dict):
     await db.flush()
     await broadcaster.broadcast(event_type, {"id": live_event.id, **payload})
 
+def calculate_billing_period(start: date, period: BillingPeriod) -> tuple[date, date]:
+    """Calculates (period_end, next_billing_date) given start date and billing frequency."""
+    if period == BillingPeriod.DAILY:
+        return start, start + timedelta(days=1)
+    elif period == BillingPeriod.WEEKLY:
+        return start + timedelta(days=6), start + timedelta(days=7)
+    elif period == BillingPeriod.YEARLY:
+        try:
+            nxt = start.replace(year=start.year + 1)
+        except ValueError:
+            nxt = start + timedelta(days=365)
+        return nxt - timedelta(days=1), nxt
+    else:  # MONTHLY default
+        month = start.month + 1
+        year = start.year
+        if month > 12:
+            month = 1
+            year += 1
+        max_day = calendar.monthrange(year, month)[1]
+        nxt = date(year, month, min(start.day, max_day))
+        return nxt - timedelta(days=1), nxt
+
 # ======================================================================================
 # 5. PURE SET-BASED RECURRING BILLING ENGINE (SQL Locks & CTEs)
 # ======================================================================================
@@ -598,8 +621,11 @@ def generate_invoice_pdf(invoice: Invoice) -> bytes:
     ]
 
     items = [[Paragraph("<b>Description</b>", val_style), Paragraph("<b>Qty</b>", val_style), Paragraph("<b>Unit Price</b>", val_style), Paragraph("<b>Amount</b>", val_style)]]
-    for line in invoice.lines:
-        items.append([Paragraph(line.description, sub_style), str(line.quantity), f"${line.unit_price:,.2f}", f"${line.total:,.2f}"])
+    if invoice.lines:
+        for line in invoice.lines:
+            items.append([Paragraph(line.description, sub_style), str(line.quantity), f"${line.unit_price:,.2f}", f"${line.total:,.2f}"])
+    else:
+        items.append([Paragraph("Subscription Recurring Service Charge", sub_style), "1", f"${invoice.subtotal:,.2f}", f"${invoice.total_amount:,.2f}"])
     
     t = Table(items, colWidths=[250, 50, 100, 120])
     t.setStyle(TableStyle([
@@ -762,7 +788,11 @@ async def list_plans(db: AsyncSession = Depends(get_db)):
 # --- SUBSCRIPTIONS (LIFECYCLE) ---
 @api_router.get("/subscriptions")
 async def list_subscriptions(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    q = select(Subscription).options(selectinload(Subscription.plan), selectinload(Subscription.customer))
+    q = select(Subscription).options(
+        selectinload(Subscription.plan),
+        selectinload(Subscription.customer),
+        selectinload(Subscription.lines)
+    )
     if user.role == UserRole.CUSTOMER:
         q = q.where(Subscription.customer_id == user.id)
     res = await db.execute(q.order_by(Subscription.id.desc()).limit(100))
@@ -772,6 +802,7 @@ async def list_subscriptions(user: User = Depends(get_current_user), db: AsyncSe
         "subscription_number": s.subscription_number,
         "customer": s.customer.full_name if s.customer else "N/A",
         "plan": s.plan.name if s.plan else "N/A",
+        "total_amount": float(sum(l.total for l in s.lines)) if s.lines else float(s.plan.price if s.plan else 0),
         "status": s.status.value,
         "start_date": str(s.start_date),
         "next_billing_date": str(s.next_billing_date)
@@ -783,19 +814,23 @@ async def create_subscription(sub_in: SubscriptionCreate, user: User = Depends(g
     count = (await db.execute(select(func.count(Subscription.id)))).scalar() or 0
     sub_num = f"SUB-{(count + 1):06d}"
     
+    plan = (await db.execute(select(Plan).where(Plan.id == sub_in.plan_id))).scalar_one()
+    period_end, next_billing = calculate_billing_period(sub_in.start_date, plan.billing_period)
+
     sub = Subscription(
         subscription_number=sub_num,
         customer_id=cust_id,
         plan_id=sub_in.plan_id,
         status=SubscriptionStatus.ACTIVE,
         start_date=sub_in.start_date,
-        next_billing_date=sub_in.start_date,
+        next_billing_date=next_billing,
     )
     db.add(sub)
     await db.flush()
 
     prod = (await db.execute(select(Product).where(Product.id == sub_in.product_id))).scalar_one()
-    unit_price = prod.sales_price
+    unit_price = plan.price
+    var = None
     if sub_in.variant_id:
         var = (await db.execute(select(ProductVariant).where(ProductVariant.id == sub_in.variant_id))).scalar_one_or_none()
         if var:
@@ -803,14 +838,67 @@ async def create_subscription(sub_in: SubscriptionCreate, user: User = Depends(g
     
     subtotal = unit_price * sub_in.quantity
     tax = round(subtotal * Decimal("0.15"), 2)
+    total = subtotal + tax
+
     line = SubscriptionLine(
         subscription_id=sub.id, product_id=prod.id, variant_id=sub_in.variant_id,
-        quantity=sub_in.quantity, unit_price=unit_price, tax_amount=tax, subtotal=subtotal, total=subtotal + tax
+        quantity=sub_in.quantity, unit_price=unit_price, tax_amount=tax, subtotal=subtotal, total=total
     )
     db.add(line)
+    await db.flush()
+
+    # Non-Negotiable Requirement #2: Backend generates first invoice upon subscription creation
+    inv_count = (await db.execute(select(func.count(Invoice.id)))).scalar() or 0
+    inv_num = f"INV-{sub_in.start_date.strftime('%Y%m')}-{(inv_count + 1):06d}"
+    due_date = sub_in.start_date + timedelta(days=14)
+
+    inv = Invoice(
+        invoice_number=inv_num,
+        subscription_id=sub.id,
+        customer_id=cust_id,
+        status=InvoiceStatus.CONFIRMED,
+        period_start=sub_in.start_date,
+        period_end=period_end,
+        issue_date=date.today(),
+        due_date=due_date,
+        subtotal=subtotal,
+        tax_amount=tax,
+        discount_amount=Decimal("0.00"),
+        total_amount=total,
+        paid_amount=Decimal("0.00"),
+        balance_due=total,
+    )
+    db.add(inv)
+    await db.flush()
+
+    desc = f"{plan.name} - {prod.name}"
+    if var:
+        desc += f" ({var.attribute}: {var.value})"
+
+    inv_line = InvoiceLine(
+        invoice_id=inv.id,
+        product_id=prod.id,
+        description=desc,
+        quantity=sub_in.quantity,
+        unit_price=unit_price,
+        tax_rate=Decimal("15.00"),
+        tax_amount=tax,
+        subtotal=subtotal,
+        total=total,
+    )
+    db.add(inv_line)
     await db.commit()
+
     await emit_live_event(db, "subscription.created", {"subscription_id": sub.id, "subscription_number": sub.subscription_number})
-    return {"id": sub.id, "subscription_number": sub.subscription_number, "status": sub.status.value}
+    await emit_live_event(db, "invoice.created", {"invoice_id": inv.id, "invoice_number": inv.invoice_number, "total_amount": float(inv.total_amount)})
+    return {
+        "id": sub.id,
+        "subscription_number": sub.subscription_number,
+        "status": sub.status.value,
+        "invoice_id": inv.id,
+        "invoice_number": inv.invoice_number,
+        "total_amount": float(inv.total_amount)
+    }
 
 @api_router.post("/subscriptions/{sub_id}/action/{action_name}")
 async def subscription_action(sub_id: int, action_name: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -1118,9 +1206,9 @@ FRONTEND_HTML = """
               )}
 
               {activeTab === 'new_subscription' && (
-                <NewSubscriptionWizard plans={plans} products={products} token={token} onSuccess={() => {
-                  showToast("Subscription Created Successfully!");
-                  setActiveTab('subscriptions');
+                <NewSubscriptionWizard plans={plans} products={products} token={token} onSuccess={(d) => {
+                  showToast(`Subscription ${d?.subscription_number || ''} activated! Invoice ${d?.invoice_number || ''} generated for $${d?.total_amount ? d.total_amount.toFixed(2) : ''}.`);
+                  setActiveTab('invoices');
                   loadData();
                 }} />
               )}
@@ -1318,6 +1406,7 @@ FRONTEND_HTML = """
                   <th className="p-4">Number</th>
                   <th className="p-4">Customer</th>
                   <th className="p-4">Plan</th>
+                  <th className="p-4">Amount</th>
                   <th className="p-4">Status</th>
                   <th className="p-4">Next Billing</th>
                   <th className="p-4 text-right">Actions</th>
@@ -1329,6 +1418,7 @@ FRONTEND_HTML = """
                     <td className="p-4 font-bold text-indigo-600">{s.subscription_number}</td>
                     <td className="p-4 font-medium">{s.customer}</td>
                     <td className="p-4">{s.plan}</td>
+                    <td className="p-4 font-bold text-slate-800 dark:text-slate-100">${s.total_amount ? s.total_amount.toFixed(2) : '0.00'}</td>
                     <td className="p-4">
                       <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
                         s.status === 'ACTIVE' ? 'bg-emerald-100 text-emerald-700' :
@@ -1583,7 +1673,7 @@ FRONTEND_HTML = """
       const currentPlan = plans.find(p => p.id === parseInt(selectedPlan));
       const currentVar = currentProd?.variants.find(v => v.id === parseInt(selectedVariant));
 
-      const basePrice = currentProd ? currentProd.sales_price : 0;
+      const basePrice = currentPlan ? currentPlan.price : (currentProd ? currentProd.sales_price : 0);
       const extraPrice = currentVar ? currentVar.extra_price : 0;
       const unitTotal = basePrice + extraPrice;
       const subtotal = unitTotal * quantity;
@@ -1603,7 +1693,12 @@ FRONTEND_HTML = """
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
           body: JSON.stringify(body)
         });
-        if (res.ok) onSuccess();
+        const d = await res.json();
+        if (res.ok) {
+          onSuccess(d);
+        } else {
+          alert(d.detail || "Subscription creation failed");
+        }
       };
 
       return (
@@ -1648,11 +1743,11 @@ FRONTEND_HTML = """
               <div>
                 <h4 className="font-bold text-sm uppercase tracking-wider text-slate-400 mb-4">Summary & Preview</h4>
                 <div className="space-y-2 text-sm">
-                  <div className="flex justify-between"><span>Base Price:</span><span className="font-semibold">${basePrice.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span>Variant Modifier:</span><span className="font-semibold">+${extraPrice.toFixed(2)}</span></div>
+                  <div className="flex justify-between"><span>Plan Rate ({currentPlan ? currentPlan.billing_period : 'MONTHLY'}):</span><span className="font-semibold">${basePrice.toFixed(2)}</span></div>
+                  {extraPrice > 0 && <div className="flex justify-between"><span>Variant Extra:</span><span className="font-semibold">+${extraPrice.toFixed(2)}</span></div>}
                   <div className="flex justify-between"><span>Unit Price:</span><span className="font-semibold">${unitTotal.toFixed(2)}</span></div>
                   <div className="flex justify-between"><span>Subtotal ({quantity}x):</span><span className="font-semibold">${subtotal.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span>Estimated Tax (15%):</span><span className="font-semibold">${tax.toFixed(2)}</span></div>
+                  <div className="flex justify-between"><span>Estimated Tax (15% VAT):</span><span className="font-semibold">${tax.toFixed(2)}</span></div>
                   <div className="border-t border-slate-200 dark:border-slate-700 pt-2 flex justify-between text-base font-bold text-indigo-600">
                     <span>Total Recurring:</span><span>${total.toFixed(2)}</span>
                   </div>
