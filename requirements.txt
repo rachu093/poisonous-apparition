@@ -11,3 +11,4 @@ argon2-cffi>=23.1.0
 pyjwt>=2.8.0
 reportlab>=4.1.0
 email-validator
+python-multipart
